@@ -165,6 +165,30 @@ public class BinaryMapIndexReaderStats {
 		public String requestWord = "";
 		Map<BinaryMapIndexReaderApiName, StatByAPI> byApis = new HashMap<>();
 		Map<String, WordSearchStat> wordStats = new HashMap<String, WordSearchStat>();
+		private final List<AccessStat> accessStats = new ArrayList<>();
+
+		public static class AccessStat {
+			public final BinaryMapIndexReaderApiName api;
+			public final BinaryMapIndexReaderSubApiName subApi;
+			public final String mapName;
+			public final String requestWord;
+			public final long timeNs;
+			public final long bytes;
+			public final long count;
+			public final long calls;
+
+			AccessStat(BinaryMapIndexReaderApiName api, BinaryMapIndexReaderSubApiName subApi, String mapName,
+					String requestWord, long timeNs, long bytes, long count, long calls) {
+				this.api = api;
+				this.subApi = subApi;
+				this.mapName = mapName;
+				this.requestWord = requestWord;
+				this.timeNs = timeNs;
+				this.bytes = bytes;
+				this.count = count;
+				this.calls = calls;
+			}
+		}
 
 		public Map<String, WordSearchStat> getWordStats() {
 			return wordStats;
@@ -204,6 +228,28 @@ public class BinaryMapIndexReaderStats {
 			List<SubStatByAPI> result = new ArrayList<>(grouped.values());
 			result.sort((a, b) -> Long.compare(b.time, a.time));
 			return result;
+		}
+
+		public List<AccessStat> getAccessStats() {
+			return Collections.unmodifiableList(accessStats);
+		}
+
+		public String toAccessCsvString() {
+			StringBuilder sb = new StringBuilder();
+			sb.append("=== ACCESS_REPORT ===").append('\n');
+			sb.append("api,subApi,mapName,requestWord,timeNs,bytes,count,calls");
+			for (AccessStat accessStat : accessStats) {
+				sb.append('\n');
+				sb.append(csv(accessStat.api == null ? "" : accessStat.api.name())).append(',')
+						.append(csv(accessStat.subApi == null ? "" : accessStat.subApi.name())).append(',')
+						.append(csv(accessStat.mapName)).append(',')
+						.append(csv(accessStat.requestWord)).append(',')
+						.append(accessStat.timeNs).append(',')
+						.append(accessStat.bytes).append(',')
+						.append(accessStat.count).append(',')
+						.append(accessStat.calls);
+			}
+			return sb.toString();
 		}
 		
 		public long beginSearchStats(BinaryMapIndexReaderApiName api, SearchRequest<?> req, BinaryIndexPart part, CodedInputStream codedIS, String extraInfo) {
@@ -256,6 +302,10 @@ public class BinaryMapIndexReaderStats {
 			statByAPI.bytes += bytes;
 			statByAPI.calls++;
 			statByAPI.time += timeCall;
+			if (api == BinaryMapIndexReaderApiName.POI_BY_NAME || api == BinaryMapIndexReaderApiName.POI_BY_TYPE) {
+				accessStats.add(new AccessStat(api, null, part == null ? "" : part.getName(), requestWord,
+						timeCall, bytes, objects.size(), 1));
+			}
 		}
 
 		public long beginSubSearchStats(int size) {
@@ -292,6 +342,20 @@ public class BinaryMapIndexReaderStats {
 			subStatByAPI.add(timeCall, size - subSize, bytes, bytesSkippedBySeek,
 					payloadBytesParsed, decodeTimeNs, matcherTimeNs, poiBlocksRead,
 					existedPoiObjectsInReadBlocks, matchedPoiObjectsInReadBlocks, maxObjectsPerBlock);
+			if (api == BinaryMapIndexReaderApiName.POI_BY_NAME || api == BinaryMapIndexReaderApiName.POI_BY_TYPE) {
+				accessStats.add(new AccessStat(api, op, obf, requestWord, timeCall, bytes,
+						existedPoiObjectsInReadBlocks, 1));
+			}
+		}
+
+		private static String csv(String value) {
+			if (value == null) {
+				return "";
+			}
+			if (value.indexOf(',') >= 0 || value.indexOf('"') >= 0 || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) {
+				return '"' + value.replace("\"", "\"\"") + '"';
+			}
+			return value;
 		}
 
 		@Override

@@ -13,16 +13,17 @@ import org.apache.commons.logging.Log;
 public final class BloomFilter {
 	
 	public static final int VERSION = 0; // with 2026-04-01 version will be 1
-	
-	private static final int BOX_BITS = 512;
+	public static final int MAX_SATURATION_BITS = 384;
+
+	private static final int BLOOM_BITS = 512;
 	private static final int DEFAULT_HASHES = 5;
-	private static final int BOX_SIZE = BOX_BITS / Byte.SIZE;
+	private static final int BLOOM_SIZE = BLOOM_BITS / Byte.SIZE;
 	
 	private static final Log log = PlatformUtil.getLog(BloomFilter.class);
 
 	private static final LongAdder writeBoxBitAcc = new LongAdder();
 	private static final LongAdder writeBoxAcc = new LongAdder(), writeBoxCount = new LongAdder();
-	private static final LongAdder skipBoxAcc = new LongAdder(), readBoxCount = new LongAdder(), falsePsitiveBoxAcc = new LongAdder();
+	private static final LongAdder skipCount = new LongAdder(), readBoxCount = new LongAdder(), falsePositiveCount = new LongAdder();
 	
 	private static final BloomFilter INSTANCE = new BloomFilter();
 
@@ -34,18 +35,18 @@ public final class BloomFilter {
 	}
 	
 	public String logSkipRatio() {
-		return String.format("True ratio: %d / %d = %.2f, False ratio: %d / %d = %.2f", skipBoxAcc.sum(), readBoxCount.sum(),
-				100 * skipBoxAcc.sum() / (double) readBoxCount.sum(),
-				falsePsitiveBoxAcc.sum(), readBoxCount.sum(),
-				100 * falsePsitiveBoxAcc.sum() / (double) readBoxCount.sum());
+		return String.format("True ratio: %d / %d = %.2f, False ratio: %d / %d = %.2f", skipCount.sum(), readBoxCount.sum(),
+				100 * skipCount.sum() / (double) readBoxCount.sum(),
+				falsePositiveCount.sum(), readBoxCount.sum(),
+				100 * falsePositiveCount.sum() / (double) readBoxCount.sum());
 	}
 
 	public static void incFalsePositive() {
-		falsePsitiveBoxAcc.increment();
+		falsePositiveCount.increment();
 	}
 	
 	public void logInfo() {
-		log.info("Avg box's tokens: " + writeBoxAcc.sum() + "/" + writeBoxCount.sum());
+		log.info("Avg extended tokens count: " + writeBoxAcc.sum() + "/" + writeBoxCount.sum());
 		log.info("Avg bloom bits: " + writeBoxBitAcc.sum() + "/" + writeBoxCount.sum());
 	}
 
@@ -74,7 +75,7 @@ public final class BloomFilter {
 			return null;
 		}
 
-		byte[] bloom = new byte[BOX_SIZE];
+		byte[] bloom = new byte[BLOOM_SIZE];
 		Collection<String> extTokens = extendTokens(tokens);
 		for (String token : extTokens) {
 			addToken(bloom, token);
@@ -181,14 +182,14 @@ public final class BloomFilter {
 				return true;
 			}
 		}
-		skipBoxAcc.increment();
+		skipCount.increment();
 		return false;
 	}
 
 	public static void resetStats() {
 		readBoxCount.reset();
-		falsePsitiveBoxAcc.reset();
-		skipBoxAcc.reset();
+		falsePositiveCount.reset();
+		skipCount.reset();
 
 		writeBoxAcc.reset();
 		writeBoxCount.reset();

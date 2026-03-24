@@ -34,6 +34,17 @@ public class BinaryMapPoiReaderAdapter {
 	private static final int ZOOM_TO_SKIP_FILTER_READ = 6;
 	private static final int ZOOM_TO_SKIP_FILTER = 3;
 	private static final int BUCKET_SEARCH_BY_NAME = 15; // should be bigger 100?
+	private static final int POI_NAME_SIDECAR_PREFIX_LENGTH = 4;
+	private static final int POI_NAME_SIDECAR_NEXT2_LENGTH = 2;
+	private static final int POI_NAME_INDEX_DATA_SIDECAR_FIELD_NUMBER = 7;
+	private static final int POI_NAME_SIDECAR_NODE_PARENT_FIELD_NUMBER = 1;
+	private static final int POI_NAME_SIDECAR_NODE_KEY_SEGMENT_FIELD_NUMBER = 2;
+	private static final int POI_NAME_SIDECAR_NODE_CONTINUATION_DEPTH_FIELD_NUMBER = 3;
+	private static final int POI_NAME_SIDECAR_NODE_ATOM_INDEX_FIELD_NUMBER = 4;
+	private static final int POI_NAME_SIDECAR_NODE_RESIDUAL_ATOM_INDEX_FIELD_NUMBER = 5;
+	private static final int POI_NAME_SIDECAR_NODE_CHILD_NODE_INDEX_FIELD_NUMBER = 6;
+	private static final int POI_NAME_SIDECAR_NODE_TERMINAL_FIELD_NUMBER = 7;
+	private static final int POI_NAME_SIDECAR_ROOT_PARENT_INDEX = 0xFFFFFFFF;
 	private static final int BASE_POI_SHIFT = SHIFT_BITS_CATEGORY;// 7
 	private static final int FINAL_POI_SHIFT = BinaryMapIndexReader.SHIFT_COORDINATES;// 5
 	private static final int BASE_POI_ZOOM = 31 - BASE_POI_SHIFT;// 24 zoom
@@ -451,6 +462,38 @@ public class BinaryMapPoiReaderAdapter {
 		byte[] data;
 		int version = -1;
 	}
+
+	private static class PoiNameAtomCandidate {
+		int x;
+		int y;
+		int zoom = 15;
+		int shift = Integer.MIN_VALUE;
+		boolean bloomMatched = true;
+		int filterIndex;
+	}
+
+	private static class PoiNameSidecarNodeDef {
+		int parentNodeIndex = POI_NAME_SIDECAR_ROOT_PARENT_INDEX;
+		String keySegment;
+		int continuationDepth;
+		List<Integer> atomIndexes = new ArrayList<>();
+		List<Integer> residualAtomIndexes = new ArrayList<>();
+		List<Integer> childNodeIndexes = new ArrayList<>();
+		boolean terminal;
+	}
+
+	private static class PoiNameSidecarDef {
+		List<PoiNameSidecarNodeDef> nodes = new ArrayList<>();
+		Map<Integer, List<Integer>> childNodeIndexesByParent = new HashMap<>();
+
+		void indexNodes() {
+			childNodeIndexesByParent.clear();
+			for (int nodeIndex = 0; nodeIndex < nodes.size(); nodeIndex++) {
+				PoiNameSidecarNodeDef node = nodes.get(nodeIndex);
+				childNodeIndexesByParent.computeIfAbsent(node.parentNodeIndex, k -> new ArrayList<>()).add(nodeIndex);
+			}
+		}
+	}
 	
 	private BloomFilterAlgorithmDef readFilter(BloomFilterAlgorithmDef activeFilter, int bloomFilterIndex)
 			throws IOException {
@@ -524,7 +567,9 @@ public class BinaryMapPoiReaderAdapter {
 			}
 			case OsmandOdb.OsmAndPoiNameIndex.DATA_FIELD_NUMBER: {
 				if (listOffsets != null) {
-					for (TIntArrayList dataOffsets : listOffsets) {
+					for (int queryIndex = 0; queryIndex < listOffsets.size(); queryIndex++) {
+						TIntArrayList dataOffsets = listOffsets.get(queryIndex);
+						String currentQueryToken = queries.get(queryIndex);
 						TIntLongHashMap offsetMap = new TIntLongHashMap();
 						listOfSepOffsets.add(offsetMap);
 						dataOffsets.sort(); // 1104125
@@ -532,7 +577,7 @@ public class BinaryMapPoiReaderAdapter {
 							codedIS.seek(dataOffsets.get(i) + offset);
 							int len = codedIS.readRawVarint32();
 							long oldLim = codedIS.pushLimitLong((long) len);
-							readPoiNameIndexData(offsetMap, req, region, activeFilter, nameIndexCoordinates, queries);
+							readPoiNameIndexData(offsetMap, req, region, activeFilter, nameIndexCoordinates, currentQueryToken, queries);
 							codedIS.popLimit(oldLim);
 							if (req.isCancelled()) {
 								codedIS.skipRawBytes(codedIS.getBytesUntilLimit());
@@ -576,20 +621,34 @@ public class BinaryMapPoiReaderAdapter {
 
 	}
 
-
 	private void readPoiNameIndexData(TIntLongHashMap offsets, SearchRequest<Amenity> req, PoiRegion region,
-			BloomFilterAlgorithmDef supportedBloomFilter, List<Integer> nameIndexCoordinates, List<String> queryTokens) throws IOException {
+			BloomFilterAlgorithmDef supportedBloomFilter, List<Integer> nameIndexCoordinates, String currentQueryToken,
+			List<String> queryTokens) throws IOException {
+		List<PoiNameAtomCandidate> atomCandidates = new ArrayList<>();
+		PoiNameSidecarDef sidecar = null;
 		while (true) {
 			int t = codedIS.readTag();
 			int tag = WireFormat.getTagFieldNumber(t);
 			switch (tag) {
 				case 0:
+					applyPoiNameIndexDataCandidates(offsets, req, region, supportedBloomFilter, nameIndexCoordinates,
+							currentQueryToken, queryTokens, atomCandidates, sidecar);
 					return;
 				case OsmAndPoiNameIndexData.ATOMS_FIELD_NUMBER:
 					int len = codedIS.readRawVarint32();
 					long oldLim = codedIS.pushLimitLong((long) len);
-					readPoiNameIndexDataAtom(offsets, req, region, supportedBloomFilter, nameIndexCoordinates, queryTokens);
+					atomCandidates.add(readPoiNameIndexDataAtom(supportedBloomFilter, queryTokens,
+							shouldUseBloomForCurrentToken(req.matcherMode, currentQueryToken)));
 					codedIS.popLimit(oldLim);
+					break;
+				case POI_NAME_INDEX_DATA_SIDECAR_FIELD_NUMBER:
+					int sidecarLen = codedIS.readRawVarint32();
+					long sidecarOldLim = codedIS.pushLimitLong((long) sidecarLen);
+					if (sidecar == null) {
+						sidecar = new PoiNameSidecarDef();
+					}
+					sidecar.nodes.add(readPoiNameSidecarNode());
+					codedIS.popLimit(sidecarOldLim);
 					break;
 				default:
 					skipUnknownField(t);
@@ -598,72 +657,304 @@ public class BinaryMapPoiReaderAdapter {
 		}
 	}
 
-	private void readPoiNameIndexDataAtom(TIntLongHashMap offsets, SearchRequest<Amenity> req, PoiRegion region, BloomFilterAlgorithmDef bloomFilter,
-	                                      List<Integer> nameIndexCoordinates, List<String> queryTokens) throws IOException {
-		int x = 0;
-		int y = 0;
-		int zoom = 15;
-		int shift = Integer.MIN_VALUE;
-		boolean bloomMatched = true;
-		int filterIndex = 0; 
+	private PoiNameAtomCandidate readPoiNameIndexDataAtom(BloomFilterAlgorithmDef bloomFilter,
+	                                      List<String> queryTokens, boolean useBloom) throws IOException {
+		PoiNameAtomCandidate candidate = new PoiNameAtomCandidate();
 		while (true) {
 			int t = codedIS.readTag();
 			int tag = WireFormat.getTagFieldNumber(t);
 			switch (tag) {
 			case 0:
-				if (!bloomMatched) {
-					return;
-				}
-				if (shift != Integer.MIN_VALUE) {
-					int x31 = (x << (31 - zoom));
-					int y31 = (y << (31 - zoom));
-					int x31r = ((x + 1) << (31 - zoom));
-					int y31b = ((y + 1) << (31 - zoom));
-					QuadRect r = new QuadRect(x31, y31, x31r, y31b);
-					if (req.contains(x31, y31, x31, y31) || r.contains(req.x, req.y, req.x, req.y)) {
-						long d = Math.abs(req.x - x31) + Math.abs(req.y - y31);
-						offsets.put(shift, d);
-					}
-
-					List<Void> bboxResult = new ArrayList<>();
-					region.bboxIndexCache.queryInBox(new QuadRect(x31, y31, x31, y31), bboxResult);
-					if (bboxResult.isEmpty()) {
-						nameIndexCoordinates.add(x31);
-						nameIndexCoordinates.add(y31);
-					}
-				}
-				return;
+				return candidate;
 			case OsmandOdb.OsmAndPoiNameIndexDataAtom.X_FIELD_NUMBER:
-				x = codedIS.readUInt32();
+				candidate.x = codedIS.readUInt32();
 				break;
 			case OsmandOdb.OsmAndPoiNameIndexDataAtom.Y_FIELD_NUMBER:
-				y = codedIS.readUInt32();
+				candidate.y = codedIS.readUInt32();
 				break;
 			case OsmandOdb.OsmAndPoiNameIndexDataAtom.ZOOM_FIELD_NUMBER:
-				zoom = codedIS.readUInt32();
+				candidate.zoom = codedIS.readUInt32();
 				break;
 			case OsmandOdb.OsmAndPoiNameIndexDataAtom.BLOOMINDEX_FIELD_NUMBER:
 				byte[] bloom = codedIS.readBytes().toByteArray();
-				if (bloomFilter != null && bloomFilter.index == filterIndex) { 
-					bloomMatched &= BloomFilter.getInstance().matches(bloom, queryTokens);
+				if (useBloom && bloomFilter != null && bloomFilter.index == candidate.filterIndex) {
+					candidate.bloomMatched &= BloomFilter.getInstance().matches(bloom, queryTokens);
 				}
-				filterIndex++;
+				candidate.filterIndex++;
 				break;
 			case OsmandOdb.OsmAndPoiNameIndexDataAtom.SHIFTTO_FIELD_NUMBER:
 				long l = readInt();
 				if(l > Integer.MAX_VALUE) {
 					throw new IllegalStateException();
 				}
-				shift = (int) l;
-				if (!bloomMatched) {
+				candidate.shift = (int) l;
+				if (!candidate.bloomMatched) {
 					codedIS.skipRawBytes(codedIS.getBytesUntilLimit());
-					return;
+					return candidate;
 				}
 				break;
 			default:
 				skipUnknownField(t);
 				break;
 			}
+		}
+	}
+
+	private void applyPoiNameIndexDataCandidates(TIntLongHashMap offsets, SearchRequest<Amenity> req, PoiRegion region,
+			BloomFilterAlgorithmDef bloomFilter, List<Integer> nameIndexCoordinates, String currentQueryToken,
+			List<String> queryTokens, List<PoiNameAtomCandidate> atomCandidates, PoiNameSidecarDef sidecar) {
+		if (sidecar != null) {
+			sidecar.indexNodes();
+		}
+		List<Integer> atomIndexesToVisit = selectAtomIndexes(req.matcherMode, currentQueryToken, atomCandidates.size(), sidecar);
+		for (Integer atomIndex : atomIndexesToVisit) {
+			if (atomIndex == null || atomIndex < 0 || atomIndex >= atomCandidates.size()) {
+				continue;
+			}
+			PoiNameAtomCandidate candidate = atomCandidates.get(atomIndex);
+			if (!candidate.bloomMatched || candidate.shift == Integer.MIN_VALUE) {
+				continue;
+			}
+			addPoiNameAtomCandidate(offsets, req, region, nameIndexCoordinates, candidate);
+		}
+	}
+
+	private void addPoiNameAtomCandidate(TIntLongHashMap offsets, SearchRequest<Amenity> req, PoiRegion region,
+			List<Integer> nameIndexCoordinates, PoiNameAtomCandidate candidate) {
+		int x31 = (candidate.x << (31 - candidate.zoom));
+		int y31 = (candidate.y << (31 - candidate.zoom));
+		int x31r = ((candidate.x + 1) << (31 - candidate.zoom));
+		int y31b = ((candidate.y + 1) << (31 - candidate.zoom));
+		QuadRect r = new QuadRect(x31, y31, x31r, y31b);
+		if (req.contains(x31, y31, x31, y31) || r.contains(req.x, req.y, req.x, req.y)) {
+			long d = Math.abs(req.x - x31) + Math.abs(req.y - y31);
+			offsets.put(candidate.shift, d);
+		}
+
+		List<Void> bboxResult = new ArrayList<>();
+		region.bboxIndexCache.queryInBox(new QuadRect(x31, y31, x31, y31), bboxResult);
+		if (bboxResult.isEmpty()) {
+			nameIndexCoordinates.add(x31);
+			nameIndexCoordinates.add(y31);
+		}
+	}
+
+	private List<Integer> selectAtomIndexes(StringMatcherMode matcherMode, String currentQueryToken, int atomCount,
+			PoiNameSidecarDef sidecar) {
+		if (!isPrefixSidecarMode(matcherMode) || Algorithms.isEmpty(currentQueryToken) || atomCount == 0) {
+			return buildFullAtomIndexes(atomCount);
+		}
+		int encodedLength = currentQueryToken.length();
+		if (encodedLength <= POI_NAME_SIDECAR_PREFIX_LENGTH + 1) {
+			return buildFullAtomIndexes(atomCount);
+		}
+		if (sidecar == null) {
+			return buildFullAtomIndexes(atomCount);
+		}
+		List<Integer> selected = selectAtomIndexesFromHierarchy(sidecar, currentQueryToken, atomCount);
+		if (!Algorithms.isEmpty(selected)) {
+			return selected;
+		}
+		return buildFullAtomIndexes(atomCount);
+	}
+
+	private List<Integer> selectAtomIndexesFromHierarchy(PoiNameSidecarDef sidecar, String currentQueryToken, int atomCount) {
+		if (sidecar == null || Algorithms.isEmpty(sidecar.nodes) || Algorithms.isEmpty(currentQueryToken)) {
+			return buildFullAtomIndexes(atomCount);
+		}
+		String continuation = extractContinuation(currentQueryToken);
+		if (Algorithms.isEmpty(continuation)) {
+			List<Integer> rootResidualAtomIndexes = findRootResidualAtomIndexes(sidecar);
+			if (!Algorithms.isEmpty(rootResidualAtomIndexes)) {
+				return rootResidualAtomIndexes;
+			}
+			return buildFullAtomIndexes(atomCount);
+		}
+		int currentNodeIndex = findBestRootNodeIndex(sidecar, continuation);
+		if (currentNodeIndex < 0 || currentNodeIndex >= sidecar.nodes.size()) {
+			List<Integer> rootResidualAtomIndexes = findRootResidualAtomIndexes(sidecar);
+			if (!Algorithms.isEmpty(rootResidualAtomIndexes)) {
+				return rootResidualAtomIndexes;
+			}
+			return buildFullAtomIndexes(atomCount);
+		}
+		PoiNameSidecarNodeDef currentNode = sidecar.nodes.get(currentNodeIndex);
+		if (!isValidNodeForConsumedLength(currentNode, safeLength(currentNode.keySegment))) {
+			return buildFullAtomIndexes(atomCount);
+		}
+		int consumed = safeLength(currentNode.keySegment);
+		while (consumed < continuation.length()) {
+			int childNodeIndex = findMatchingChildNodeIndex(sidecar, currentNodeIndex, continuation, consumed);
+			if (childNodeIndex < 0 || childNodeIndex >= sidecar.nodes.size()) {
+				break;
+			}
+			PoiNameSidecarNodeDef childNode = sidecar.nodes.get(childNodeIndex);
+			if (!isValidNodeForConsumedLength(childNode, consumed + safeLength(childNode.keySegment))) {
+				break;
+			}
+			currentNode = childNode;
+			currentNodeIndex = childNodeIndex;
+			consumed += safeLength(childNode.keySegment);
+		}
+		if (!Algorithms.isEmpty(currentNode.atomIndexes)) {
+			return currentNode.atomIndexes;
+		}
+		if (!Algorithms.isEmpty(currentNode.residualAtomIndexes)) {
+			return currentNode.residualAtomIndexes;
+		}
+		return buildFullAtomIndexes(atomCount);
+	}
+
+	private int findBestRootNodeIndex(PoiNameSidecarDef sidecar, String continuation) {
+		List<Integer> rootIndexes = sidecar.childNodeIndexesByParent.get(POI_NAME_SIDECAR_ROOT_PARENT_INDEX);
+		if (Algorithms.isEmpty(rootIndexes)) {
+			return -1;
+		}
+		int bestNodeIndex = -1;
+		for (Integer nodeIndex : rootIndexes) {
+			if (nodeIndex == null || nodeIndex < 0 || nodeIndex >= sidecar.nodes.size()) {
+				continue;
+			}
+			PoiNameSidecarNodeDef node = sidecar.nodes.get(nodeIndex);
+			if (Algorithms.isEmpty(node.keySegment) || !continuation.startsWith(node.keySegment)) {
+				continue;
+			}
+			if (bestNodeIndex < 0 || safeLength(node.keySegment) > safeLength(sidecar.nodes.get(bestNodeIndex).keySegment)) {
+				bestNodeIndex = nodeIndex;
+			}
+		}
+		return bestNodeIndex;
+	}
+
+	private int findMatchingChildNodeIndex(PoiNameSidecarDef sidecar, int parentNodeIndex,
+			String continuation, int consumedLength) {
+		PoiNameSidecarNodeDef parentNode = sidecar.nodes.get(parentNodeIndex);
+		List<Integer> childIndexes = parentNode.childNodeIndexes;
+		if (Algorithms.isEmpty(childIndexes)) {
+			return -1;
+		}
+		int bestNodeIndex = -1;
+		for (Integer childIndex : childIndexes) {
+			if (childIndex == null || childIndex < 0 || childIndex >= sidecar.nodes.size()) {
+				continue;
+			}
+			PoiNameSidecarNodeDef childNode = sidecar.nodes.get(childIndex);
+			if (childNode.parentNodeIndex != parentNodeIndex) {
+				continue;
+			}
+			if (Algorithms.isEmpty(childNode.keySegment)) {
+				continue;
+			}
+			if (consumedLength + childNode.keySegment.length() > continuation.length()) {
+				continue;
+			}
+			if (!continuation.regionMatches(consumedLength, childNode.keySegment, 0, childNode.keySegment.length())) {
+				continue;
+			}
+			if (bestNodeIndex < 0 || safeLength(childNode.keySegment) > safeLength(sidecar.nodes.get(bestNodeIndex).keySegment)) {
+				bestNodeIndex = childIndex;
+			}
+		}
+		return bestNodeIndex;
+	}
+
+	private boolean isValidNodeForConsumedLength(PoiNameSidecarNodeDef node, int consumedLength) {
+		return node != null && consumedLength >= 0 && (node.continuationDepth <= 0 || node.continuationDepth == consumedLength);
+	}
+
+	private List<Integer> findRootResidualAtomIndexes(PoiNameSidecarDef sidecar) {
+		List<Integer> rootIndexes = sidecar.childNodeIndexesByParent.get(POI_NAME_SIDECAR_ROOT_PARENT_INDEX);
+		if (Algorithms.isEmpty(rootIndexes)) {
+			return Collections.emptyList();
+		}
+		for (Integer nodeIndex : rootIndexes) {
+			if (nodeIndex == null || nodeIndex < 0 || nodeIndex >= sidecar.nodes.size()) {
+				continue;
+			}
+			PoiNameSidecarNodeDef node = sidecar.nodes.get(nodeIndex);
+			if (Algorithms.isEmpty(node.keySegment)
+					&& Algorithms.isEmpty(node.atomIndexes)
+					&& !Algorithms.isEmpty(node.residualAtomIndexes)) {
+				return node.residualAtomIndexes;
+			}
+		}
+		return Collections.emptyList();
+	}
+
+	private String extractContinuation(String token) {
+		if (Algorithms.isEmpty(token) || token.length() <= POI_NAME_SIDECAR_PREFIX_LENGTH) {
+			return null;
+		}
+		return token.substring(POI_NAME_SIDECAR_PREFIX_LENGTH);
+	}
+
+	private int safeLength(String value) {
+		return value == null ? 0 : value.length();
+	}
+
+	private List<Integer> buildFullAtomIndexes(int atomCount) {
+		List<Integer> atomIndexes = new ArrayList<>(atomCount);
+		for (int atomIndex = 0; atomIndex < atomCount; atomIndex++) {
+			atomIndexes.add(atomIndex);
+		}
+		return atomIndexes;
+	}
+
+	private boolean shouldUseBloomForCurrentToken(StringMatcherMode matcherMode, String currentQueryToken) {
+		return isPrefixSidecarMode(matcherMode) && !Algorithms.isEmpty(currentQueryToken)
+				&& currentQueryToken.length() >= POI_NAME_SIDECAR_PREFIX_LENGTH + POI_NAME_SIDECAR_NEXT2_LENGTH;
+	}
+
+	private boolean isPrefixSidecarMode(StringMatcherMode matcherMode) {
+		return matcherMode == StringMatcherMode.CHECK_STARTS_FROM_SPACE;
+	}
+
+	private PoiNameSidecarNodeDef readPoiNameSidecarNode() throws IOException {
+		PoiNameSidecarNodeDef entry = new PoiNameSidecarNodeDef();
+		while (true) {
+			int t = codedIS.readTag();
+			int tag = WireFormat.getTagFieldNumber(t);
+			switch (tag) {
+				case 0:
+					return entry;
+				case POI_NAME_SIDECAR_NODE_PARENT_FIELD_NUMBER:
+					entry.parentNodeIndex = codedIS.readUInt32();
+					break;
+				case POI_NAME_SIDECAR_NODE_KEY_SEGMENT_FIELD_NUMBER:
+					entry.keySegment = codedIS.readString();
+					break;
+				case POI_NAME_SIDECAR_NODE_CONTINUATION_DEPTH_FIELD_NUMBER:
+					entry.continuationDepth = codedIS.readUInt32();
+					break;
+				case POI_NAME_SIDECAR_NODE_ATOM_INDEX_FIELD_NUMBER:
+					readPackedUInt32Values(entry.atomIndexes, t);
+					break;
+				case POI_NAME_SIDECAR_NODE_RESIDUAL_ATOM_INDEX_FIELD_NUMBER:
+					readPackedUInt32Values(entry.residualAtomIndexes, t);
+					break;
+				case POI_NAME_SIDECAR_NODE_CHILD_NODE_INDEX_FIELD_NUMBER:
+					readPackedUInt32Values(entry.childNodeIndexes, t);
+					break;
+				case POI_NAME_SIDECAR_NODE_TERMINAL_FIELD_NUMBER:
+					entry.terminal = codedIS.readBool();
+					break;
+				default:
+					skipUnknownField(t);
+					break;
+			}
+		}
+	}
+
+	private void readPackedUInt32Values(List<Integer> values, int tag) throws IOException {
+		if (WireFormat.getTagWireType(tag) == WireFormat.WIRETYPE_LENGTH_DELIMITED) {
+			int len = codedIS.readRawVarint32();
+			long oldLim = codedIS.pushLimitLong((long) len);
+			while (codedIS.getBytesUntilLimit() > 0) {
+				values.add(codedIS.readUInt32());
+			}
+			codedIS.popLimit(oldLim);
+		} else {
+			values.add(codedIS.readUInt32());
 		}
 	}
 
